@@ -1,0 +1,12 @@
+# PowerShell
+*.log
+.commitmsg.txt
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
