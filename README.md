@@ -32,7 +32,9 @@ Clients that do not use Dell SupportAssist or OS Recovery do not need this compo
 - Stops and deletes matched services, removes scheduled tasks, and deletes remaining folders
 - Optionally (`-RemoveSupportAssist`) also uninstalls **Dell SupportAssist** itself — the parent application
   that can redeliver SARemediation — and cleans up leftover registry keys
-- **Dry-run by default** — reports findings without changing anything until `-Delete` is used
+- **Dry-run by default** when run locally without switches — reports findings without changing anything
+- **`-Delete` is the preferred mode for bulk ScreenConnect deployment** — run removal directly across
+  selected endpoints; use dry-run only to validate on a single test machine first
 
 ## Why SARemediation keeps coming back
 
@@ -54,6 +56,8 @@ use SupportAssist at all.
   patterns, plus the explicit `SARemediation` data path
 - Each action (uninstaller, service, task, folder) is attempted independently and reported separately, so
   a failure in one step does not stop the rest of the cleanup from being reported
+- Does **not** call `Restart-Computer` or `shutdown` — MSI uninstalls are invoked with `/norestart` to
+  avoid triggering an immediate reboot during bulk runs
 
 ## Requirements
 
@@ -72,20 +76,11 @@ Replace `monobrau/dell-saremediation-cleanup` if you fork or rename the reposito
 Use `ScriptBlock` invocation so `-Delete` binds correctly. Add a cache-buster query string so endpoints
 do not run a stale cached copy from GitHub CDN.
 
-### Dry-run (recommended first)
+For **bulk deployment**, select the target machine group in ScreenConnect, paste one of the `-Delete`
+commands below, and run. Dry-run is optional — use it on one representative endpoint before rolling out
+to the full group if you want to confirm matches first.
 
-```powershell
-#!ps
-#timeout=120000
-#maxlength=100000
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$repo = 'monobrau/dell-saremediation-cleanup'
-$url = "https://raw.githubusercontent.com/$repo/main/Remove-DellSARemediation.ps1?v=1.0.0"
-$script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
-& ([ScriptBlock]::Create($script))
-```
-
-### Delete matched items (remediation only)
+### Bulk deployment — delete remediation only (preferred)
 
 ```powershell
 #!ps
@@ -98,7 +93,7 @@ $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
 & ([ScriptBlock]::Create($script)) -Delete
 ```
 
-### Delete remediation and Dell SupportAssist (recommended when unused)
+### Bulk deployment — delete remediation and Dell SupportAssist (preferred when unused)
 
 ```powershell
 #!ps
@@ -120,15 +115,29 @@ $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
 powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "& { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $url = 'https://raw.githubusercontent.com/monobrau/dell-saremediation-cleanup/main/Remove-DellSARemediation.ps1?v=1.0.0'; $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content; & ([ScriptBlock]::Create($script)) -Delete -RemoveSupportAssist }"
 ```
 
-Output should begin with `=== Dell SARemediation Removal v1.0.0 ===`.
+Output should begin with `=== Dell SARemediation Removal v1.0.0 ===` and show `Mode: DELETE` when
+`-Delete` is used.
+
+### Dry-run (optional — single-machine validation)
+
+```powershell
+#!ps
+#timeout=120000
+#maxlength=100000
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$repo = 'monobrau/dell-saremediation-cleanup'
+$url = "https://raw.githubusercontent.com/$repo/main/Remove-DellSARemediation.ps1?v=1.0.0"
+$script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
+& ([ScriptBlock]::Create($script))
+```
 
 ## Local usage
 
 ```powershell
-# Report only
+# Dry-run / report only (script default)
 .\Remove-DellSARemediation.ps1
 
-# Remove matched remediation items (run elevated)
+# Remove matched remediation items — preferred for production cleanup (run elevated)
 .\Remove-DellSARemediation.ps1 -Delete
 
 # Skip the vendor uninstaller
@@ -147,6 +156,32 @@ Output should begin with `=== Dell SARemediation Removal v1.0.0 ===`.
 | `-RemoveSupportAssist` | off | Also uninstall Dell SupportAssist, its services/tasks/folders, and leftover registry keys |
 
 ## Example output
+
+Bulk deployment output (`-Delete`):
+
+```text
+=== Dell SARemediation Removal v1.0.0 ===
+Mode: DELETE
+Running as Administrator: True
+
+Remediation services found: 1
+Remediation uninstall entries found: 1
+Remediation scheduled tasks found: 1
+Remediation install folders found: 1
+
+[Uninstaller] RAN : Dell SupportAssist Remediation (MsiExec.exe /X{GUID} /quiet /norestart)
+[Service] REMOVED : DellSupportAssistRemediationService (Dell SupportAssist Remediation)
+[ScheduledTask] REMOVED : \Dell\SupportAssist Remediation
+[Folder] REMOVED : C:\ProgramData\Dell\SARemediation
+
+=== Summary ===
+Uninstallers run: 1; failed: 0
+Services removed: 1; failed: 0
+Scheduled tasks removed: 1; failed: 0
+Folders removed: 1; failed: 0
+```
+
+Dry-run output (no `-Delete`):
 
 ```text
 === Dell SARemediation Removal v1.0.0 ===
@@ -177,8 +212,12 @@ No changes made. Re-run with -Delete to remove matched items.
   longer on machines with large backup caches — try `180000` or higher.
 - **Actions report FAILED:** Confirm the session is elevated (Administrator). ScreenConnect sessions
   running as the logged-in user are not elevated by default.
-- **SARemediation reappears after reboot or Dell Update:** Re-run with `-RemoveSupportAssist`. Consider
-  blocking Dell SupportAssist deployment via Intune/GPO if it is not needed in the environment.
+- **SARemediation reappears after reboot or Dell Update:** Re-run bulk deployment with `-Delete
+  -RemoveSupportAssist`. Consider blocking Dell SupportAssist deployment via Intune/GPO if it is not
+  needed in the environment.
+- **Concerned about reboots during bulk runs:** The script does not reboot endpoints. MSI uninstalls
+  receive `/norestart`; exit code `3010` (reboot eventually required) is accepted as success without
+  scheduling a restart. Use `-SkipUninstaller` only if you need to avoid vendor uninstallers entirely.
 - **SIEM ticket still open after cleanup:** Resolve or allowlist the SentinelOne threat in the console,
   then close the ConnectWise ticket noting authorized Dell software was removed.
 - **`ps: illegal argument`:** The guest is **macOS** (or non-Windows). This script is Windows-only.
