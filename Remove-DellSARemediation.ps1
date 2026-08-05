@@ -20,18 +20,25 @@
     SupportAssist install folders). Off by default because it removes more than the remediation
     component (driver/firmware checks, warranty registration). Use when clients do not use SupportAssist
     and you want to prevent redelivery of SARemediation.
+
+.PARAMETER BlockReinstall
+    Apply local policies to reduce automatic redelivery: disables Dell Update / Command Update scheduled
+    tasks, disables remediation-related services, and (when combined with -Delete) also enables
+    -RemoveSupportAssist. Does not block every factory preload path; pair with Intune/GPO app blocklists
+    for fleet-wide enforcement when needed.
 #>
 [CmdletBinding()]
 param(
     [switch]$Delete,
     [switch]$SkipUninstaller,
-    [switch]$RemoveSupportAssist
+    [switch]$RemoveSupportAssist,
+    [switch]$BlockReinstall
 )
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.0.0'
+$ScriptVersion = '1.1.0'
 
 if ($env:OS -notlike '*Windows*' -and -not $IsWindows) {
     Write-Output "ERROR: This script supports Windows endpoints only."
@@ -51,6 +58,101 @@ $SupportAssistRegistryKeys = @(
     'HKLM:\SOFTWARE\Dell\SupportAssist',
     'HKLM:\SOFTWARE\WOW6432Node\Dell\SupportAssist'
 )
+$DeliveryTaskPattern = '(?i)dell.*(command\s*update|supportassist|remediation|client\s*management|update\s*service)|supportassist.*(update|remediation)'
+$DeliveryServicePattern = '(?i)supportassist|saremediation|remediation'
+$RemediationServiceDisableNames = @(
+    'Dell SupportAssist Remediation',
+    'Alienware SupportAssist Remediation'
+)
+
+if ($BlockReinstall -and $Delete) {
+    $RemoveSupportAssist = $true
+}
+
+function Get-DellUpdateDeliveryTasks {
+    if (-not (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue)) {
+        return @()
+    }
+
+    Get-ScheduledTask -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.State -ne 'Disabled' -and (
+                $_.TaskName -match $DeliveryTaskPattern -or
+                $_.TaskPath -match '\\Dell\\|\\DellInc\\'
+            )
+        }
+}
+
+function Get-DellDeliveryServices {
+    Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.StartMode -ne 'Disabled' -and (
+                $_.Name -match $DeliveryServicePattern -or
+                $_.DisplayName -match $DeliveryServicePattern -or
+                $RemediationServiceDisableNames -contains $_.DisplayName
+            )
+        }
+}
+
+function Invoke-ScheduledTaskDisableAction {
+    param(
+        [object]$Task,
+        [ref]$Stats
+    )
+
+    $path = "$($Task.TaskPath)$($Task.TaskName)"
+
+    if (-not $Delete) {
+        Write-Result -Type 'ScheduledTask' -Status 'WOULD DISABLE' -Path $path
+        $Stats.Value.WouldDisableTasks++
+        return
+    }
+
+    try {
+        Disable-ScheduledTask -TaskName $Task.TaskName -TaskPath $Task.TaskPath -ErrorAction Stop
+        Write-Result -Type 'ScheduledTask' -Status 'DISABLED' -Path $path
+        $Stats.Value.DisabledTasks++
+    }
+    catch {
+        Write-Result -Type 'ScheduledTask' -Status 'FAILED' -Path $path -Detail $_.Exception.Message
+        $Stats.Value.FailedTasks++
+    }
+}
+
+function Invoke-ServiceDisableAction {
+    param(
+        [object]$Service,
+        [ref]$Stats
+    )
+
+    $name = $Service.Name
+
+    if (-not $Delete) {
+        Write-Result -Type 'Service' -Status 'WOULD DISABLE' -Path $name -Detail ("{0}, start {1}" -f $Service.DisplayName, $Service.StartMode)
+        $Stats.Value.WouldDisableServices++
+        return
+    }
+
+    try {
+        if ($Service.State -eq 'Running') {
+            Stop-Service -Name $name -Force -ErrorAction Stop
+        }
+
+        $scOutput = & sc.exe config $name start= disabled 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Result -Type 'Service' -Status 'DISABLED' -Path $name -Detail $Service.DisplayName
+            $Stats.Value.DisabledServices++
+        }
+        else {
+            Write-Result -Type 'Service' -Status 'FAILED' -Path $name -Detail ("sc config exit {0}: {1}" -f $LASTEXITCODE, ($scOutput -join ' '))
+            $Stats.Value.FailedServices++
+        }
+    }
+    catch {
+        Write-Result -Type 'Service' -Status 'FAILED' -Path $name -Detail $_.Exception.Message
+        $Stats.Value.FailedServices++
+    }
+}
 
 function Write-Result {
     param(
@@ -463,6 +565,8 @@ $supportAssistScheduledTasks = if ($RemoveSupportAssist) { @(Get-SupportAssistSc
 $supportAssistInstallFolders = if ($RemoveSupportAssist) { @(Get-SupportAssistInstallFolders) } else { @() }
 $supportAssistUninstallerPaths = if ($RemoveSupportAssist -and -not $SkipUninstaller) { @(Get-SupportAssistUninstallerPaths) } else { @() }
 $supportAssistRegistryKeys = if ($RemoveSupportAssist) { @(Get-SupportAssistPresentRegistryKeys) } else { @() }
+$deliveryTasks = if ($BlockReinstall) { @(Get-DellUpdateDeliveryTasks) } else { @() }
+$deliveryServices = if ($BlockReinstall) { @(Get-DellDeliveryServices) } else { @() }
 
 Write-Output ("Remediation services found: {0}" -f $services.Count)
 Write-Output ("Remediation uninstall entries found: {0}{1}" -f $uninstallEntries.Count, $(if ($SkipUninstaller) { ' (skipped)' } else { '' }))
@@ -475,13 +579,20 @@ if ($RemoveSupportAssist) {
     Write-Output ("Dell SupportAssist install folders found: {0}" -f $supportAssistInstallFolders.Count)
     Write-Output ("Dell SupportAssist leftover registry keys found: {0}" -f $supportAssistRegistryKeys.Count)
 }
+if ($BlockReinstall) {
+    Write-Output ("Dell update delivery tasks found: {0}" -f $deliveryTasks.Count)
+    Write-Output ("Dell delivery services found: {0}" -f $deliveryServices.Count)
+    if ($Delete) {
+        Write-Output 'BlockReinstall: -RemoveSupportAssist is enabled automatically with -Delete.'
+    }
+}
 Write-Output ''
 
 $nothingFound = $services.Count -eq 0 -and $uninstallEntries.Count -eq 0 -and $scheduledTasks.Count -eq 0 `
     -and $installFolders.Count -eq 0 -and $supportAssistServices.Count -eq 0 `
     -and $supportAssistUninstallEntries.Count -eq 0 -and $supportAssistScheduledTasks.Count -eq 0 `
     -and $supportAssistInstallFolders.Count -eq 0 -and $supportAssistUninstallerPaths.Count -eq 0 `
-    -and $supportAssistRegistryKeys.Count -eq 0
+    -and $supportAssistRegistryKeys.Count -eq 0 -and -not $BlockReinstall
 
 if ($nothingFound) {
     Write-Output 'No Dell SARemediation or SupportAssist Remediation components detected on this system.'
@@ -504,6 +615,10 @@ $stats = @{
     WouldRemoveRegistryKeys   = 0
     RemovedRegistryKeys       = 0
     FailedRegistryKeys        = 0
+    WouldDisableTasks         = 0
+    DisabledTasks             = 0
+    WouldDisableServices      = 0
+    DisabledServices          = 0
 }
 
 foreach ($entry in $uninstallEntries) {
@@ -550,6 +665,16 @@ if ($RemoveSupportAssist) {
     }
 }
 
+if ($BlockReinstall) {
+    foreach ($task in $deliveryTasks) {
+        Invoke-ScheduledTaskDisableAction -Task $task -Stats ([ref]$stats)
+    }
+
+    foreach ($service in $deliveryServices) {
+        Invoke-ServiceDisableAction -Service $service -Stats ([ref]$stats)
+    }
+}
+
 Write-Output ''
 Write-Output '=== Summary ==='
 if ($Delete) {
@@ -560,6 +685,10 @@ if ($Delete) {
     if ($RemoveSupportAssist) {
         Write-Output ("Dell SupportAssist registry keys removed: {0}; failed: {1}" -f $stats.RemovedRegistryKeys, $stats.FailedRegistryKeys)
     }
+    if ($BlockReinstall) {
+        Write-Output ("Update delivery tasks disabled: {0}; failed: {1}" -f $stats.DisabledTasks, $stats.FailedTasks)
+        Write-Output ("Delivery services disabled: {0}; failed: {1}" -f $stats.DisabledServices, $stats.FailedServices)
+    }
 }
 else {
     Write-Output ("Uninstallers would run: {0}" -f $stats.WouldRunUninstalls)
@@ -568,6 +697,10 @@ else {
     Write-Output ("Folders would remove: {0}" -f $stats.WouldRemoveFolders)
     if ($RemoveSupportAssist) {
         Write-Output ("Dell SupportAssist registry keys would remove: {0}" -f $stats.WouldRemoveRegistryKeys)
+    }
+    if ($BlockReinstall) {
+        Write-Output ("Update delivery tasks would disable: {0}" -f $stats.WouldDisableTasks)
+        Write-Output ("Delivery services would disable: {0}" -f $stats.WouldDisableServices)
     }
     Write-Output 'No changes made. Re-run with -Delete to remove matched items.'
 }

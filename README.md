@@ -30,8 +30,8 @@ Clients that do not use Dell SupportAssist or OS Recovery do not need this compo
 - Runs vendor uninstallers (registry `UninstallString` / `QuietUninstallString`, or MSI `msiexec /x`) when
   available
 - Stops and deletes matched services, removes scheduled tasks, and deletes remaining folders
-- Optionally (`-RemoveSupportAssist`) also uninstalls **Dell SupportAssist** itself — the parent application
-  that can redeliver SARemediation — and cleans up leftover registry keys
+- Optionally (`-BlockReinstall`) disables Dell Update / Command Update delivery tasks and related
+  services, and (with `-Delete`) automatically enables `-RemoveSupportAssist` to reduce redelivery
 - **Dry-run by default** when run locally without switches — reports findings without changing anything
 - **`-Delete` is the preferred mode for bulk ScreenConnect deployment** — run removal directly across
   selected endpoints; use dry-run only to validate on a single test machine first
@@ -44,8 +44,10 @@ Dell SupportAssist Remediation is typically redelivered by:
 2. **Dell Update** or factory preload mechanisms on business laptops
 
 Running without `-RemoveSupportAssist` removes the current remediation install and snapshot data but does
-not prevent Dell SupportAssist from reinstalling it later. Use `-RemoveSupportAssist` when clients do not
-use SupportAssist at all.
+not prevent Dell SupportAssist from reinstalling it later. Use `-Delete -BlockReinstall` for the
+strongest local cleanup: removal plus disabled update delivery tasks/services and automatic
+`-RemoveSupportAssist`. For fleet-wide enforcement, also block SupportAssist via Intune/GPO or Dell
+Command Update SWB blocklists.
 
 ## Safety
 
@@ -88,9 +90,22 @@ to the full group if you want to confirm matches first.
 #maxlength=100000
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $repo = 'monobrau/dell-saremediation-cleanup'
-$url = "https://raw.githubusercontent.com/$repo/main/Remove-DellSARemediation.ps1?v=1.0.0"
+$url = "https://raw.githubusercontent.com/$repo/main/Remove-DellSARemediation.ps1?v=1.1.0"
 $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
 & ([ScriptBlock]::Create($script)) -Delete
+```
+
+### Bulk deployment — delete and block redelivery (preferred when unused)
+
+```powershell
+#!ps
+#timeout=180000
+#maxlength=100000
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$repo = 'monobrau/dell-saremediation-cleanup'
+$url = "https://raw.githubusercontent.com/$repo/main/Remove-DellSARemediation.ps1?v=1.1.0"
+$script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
+& ([ScriptBlock]::Create($script)) -Delete -BlockReinstall
 ```
 
 ### Bulk deployment — delete remediation and Dell SupportAssist (preferred when unused)
@@ -101,7 +116,7 @@ $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
 #maxlength=100000
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $repo = 'monobrau/dell-saremediation-cleanup'
-$url = "https://raw.githubusercontent.com/$repo/main/Remove-DellSARemediation.ps1?v=1.0.0"
+$url = "https://raw.githubusercontent.com/$repo/main/Remove-DellSARemediation.ps1?v=1.1.0"
 $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
 & ([ScriptBlock]::Create($script)) -Delete -RemoveSupportAssist
 ```
@@ -112,10 +127,10 @@ $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
 #!cmd
 #timeout=180000
 #maxlength=100000
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "& { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $url = 'https://raw.githubusercontent.com/monobrau/dell-saremediation-cleanup/main/Remove-DellSARemediation.ps1?v=1.0.0'; $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content; & ([ScriptBlock]::Create($script)) -Delete -RemoveSupportAssist }"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "& { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $url = 'https://raw.githubusercontent.com/monobrau/dell-saremediation-cleanup/main/Remove-DellSARemediation.ps1?v=1.1.0'; $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content; & ([ScriptBlock]::Create($script)) -Delete -BlockReinstall }"
 ```
 
-Output should begin with `=== Dell SARemediation Removal v1.0.0 ===` and show `Mode: DELETE` when
+Output should begin with `=== Dell SARemediation Removal v1.1.0 ===` and show `Mode: DELETE` when
 `-Delete` is used.
 
 ### Dry-run (optional — single-machine validation)
@@ -126,7 +141,7 @@ Output should begin with `=== Dell SARemediation Removal v1.0.0 ===` and show `M
 #maxlength=100000
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $repo = 'monobrau/dell-saremediation-cleanup'
-$url = "https://raw.githubusercontent.com/$repo/main/Remove-DellSARemediation.ps1?v=1.0.0"
+$url = "https://raw.githubusercontent.com/$repo/main/Remove-DellSARemediation.ps1?v=1.1.0"
 $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
 & ([ScriptBlock]::Create($script))
 ```
@@ -145,6 +160,9 @@ $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
 
 # Also remove Dell SupportAssist to stop redelivery (recommended when clients do not use it)
 .\Remove-DellSARemediation.ps1 -Delete -RemoveSupportAssist
+
+# Remove, block redelivery tasks/services, and auto-enable -RemoveSupportAssist
+.\Remove-DellSARemediation.ps1 -Delete -BlockReinstall
 ```
 
 ## Parameters
@@ -154,6 +172,7 @@ $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
 | `-Delete` | off | Remove/uninstall matched services, tasks, and folders |
 | `-SkipUninstaller` | off | Do not run registry uninstall strings or known vendor uninstaller executables |
 | `-RemoveSupportAssist` | off | Also uninstall Dell SupportAssist, its services/tasks/folders, and leftover registry keys |
+| `-BlockReinstall` | off | Disable Dell update delivery tasks/services; with `-Delete`, also enables `-RemoveSupportAssist` |
 
 ## Example output
 
@@ -213,7 +232,7 @@ No changes made. Re-run with -Delete to remove matched items.
 - **Actions report FAILED:** Confirm the session is elevated (Administrator). ScreenConnect sessions
   running as the logged-in user are not elevated by default.
 - **SARemediation reappears after reboot or Dell Update:** Re-run bulk deployment with `-Delete
-  -RemoveSupportAssist`. Consider blocking Dell SupportAssist deployment via Intune/GPO if it is not
+  -BlockReinstall`. Consider blocking Dell SupportAssist deployment via Intune/GPO if it is not
   needed in the environment.
 - **Concerned about reboots during bulk runs:** The script does not reboot endpoints. MSI uninstalls
   receive `/norestart`; exit code `3010` (reboot eventually required) is accepted as success without
