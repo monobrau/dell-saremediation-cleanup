@@ -38,7 +38,7 @@ param(
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.1.0'
+$ScriptVersion = '1.2.0'
 
 if ($env:OS -notlike '*Windows*' -and -not $IsWindows) {
     Write-Output "ERROR: This script supports Windows endpoints only."
@@ -307,39 +307,59 @@ function Stop-RelatedProcesses {
     }
 }
 
+function Add-NoRestartFlags {
+    param([string]$Arguments)
+
+    $args = if ($null -eq $Arguments) { '' } else { [string]$Arguments }
+
+    # Strip reboot-forcing MSI properties; Dell / nested MSI may otherwise reboot anyway.
+    $args = $args -replace '(?i)\s*REBOOT\s*=\s*(Force|Prompt|Suppress)\b', ''
+    $args = $args.Trim()
+
+    if ($args -notmatch '(?i)\bREBOOT\s*=\s*ReallySuppress\b') {
+        $args = ($args + ' REBOOT=ReallySuppress').Trim()
+    }
+    if ($args -notmatch '(?i)/norestart\b') {
+        $args = ($args + ' /norestart').Trim()
+    }
+
+    return $args
+}
+
 function Get-SilentUninstallArguments {
     param(
         [string]$Exe,
         [string]$Arguments
     )
 
-    if ($Exe -match '(?i)SupportAssist(Uninstaller|Agent)\.exe$') {
-        if ($Arguments -match '(?i)/arp|/S\b|/quiet|/qn') {
-            return $Arguments
+    # SupportAssistUninstaller.exe historically used "/arp /S" with NO reboot suppression.
+    # That path was observed to reboot endpoints during -RemoveSupportAssist. Always add /norestart.
+    if ($Exe -match '(?i)SupportAssist(Uninstaller|Agent|uninstaller)\.exe$') {
+        $args = if ([string]::IsNullOrWhiteSpace($Arguments)) { '/arp /S' } else { $Arguments.Trim() }
+        if ($args -notmatch '(?i)/arp') {
+            $args = ('/arp ' + $args).Trim()
         }
-
-        return '/arp /S'
+        if ($args -notmatch '(?i)(/S\b|/quiet|/qn|/silent)') {
+            $args = ($args + ' /S').Trim()
+        }
+        return (Add-NoRestartFlags -Arguments $args)
     }
 
     if ($Exe -match '(?i)msiexec\.exe$') {
         $Arguments = $Arguments -replace '(?i)/I\b', '/X'
 
-        if ($Arguments -match '(?i)/qn|/quiet|/passive') {
-            if ($Arguments -notmatch '(?i)/norestart|REBOOT=') {
-                return ($Arguments + ' /norestart').Trim()
-            }
-
-            return $Arguments
+        if ($Arguments -notmatch '(?i)/qn|/quiet|/passive') {
+            $Arguments = ($Arguments + ' /qn').Trim()
         }
 
-        return ($Arguments + ' /qn /norestart').Trim()
+        return (Add-NoRestartFlags -Arguments $Arguments)
     }
 
-    if ($Arguments -match '(?i)/quiet|/qn|/silent|/verysilent|/s\b|/S\b') {
-        return $Arguments
+    if ($Arguments -notmatch '(?i)/quiet|/qn|/silent|/verysilent|/s\b|/S\b') {
+        $Arguments = ($Arguments + ' /quiet').Trim()
     }
 
-    return ($Arguments + ' /quiet /norestart').Trim()
+    return (Add-NoRestartFlags -Arguments $Arguments)
 }
 
 function Invoke-UninstallCommandLine {
@@ -362,9 +382,14 @@ function Invoke-UninstallCommandLine {
     }
 
     $arguments = Get-SilentUninstallArguments -Exe $exe -Arguments $arguments
+    Write-Output ("[Uninstaller] EXEC : {0} {1}" -f $exe, $arguments)
 
     $proc = Start-Process -FilePath $exe -ArgumentList $arguments -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop
-    if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
+    if ($proc.ExitCode -eq 3010) {
+        Write-Output '[Uninstaller] WARN : exit 3010 (reboot requested by installer). Script did not call Restart-Computer; schedule reboot later if needed.'
+        return
+    }
+    if ($proc.ExitCode -ne 0) {
         throw "Uninstaller exited with code $($proc.ExitCode)"
     }
 }
@@ -412,12 +437,16 @@ function Invoke-SupportAssistUninstallerAction {
     try {
         Stop-RelatedProcesses -NamePatterns @('SupportAssist', 'SARemediation', 'DellSupportAssist')
         $arguments = Get-SilentUninstallArguments -Exe $ExePath -Arguments ''
+        Write-Output ("[SupportAssist-Uninstaller] EXEC : {0} {1}" -f $ExePath, $arguments)
         $proc = Start-Process -FilePath $ExePath -ArgumentList $arguments -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop
-        if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
+        if ($proc.ExitCode -eq 3010) {
+            Write-Output '[SupportAssist-Uninstaller] WARN : exit 3010 (reboot requested). Script did not initiate reboot.'
+        }
+        elseif ($proc.ExitCode -ne 0) {
             throw "Uninstaller exited with code $($proc.ExitCode)"
         }
 
-        Write-Result -Type 'SupportAssist-Uninstaller' -Status 'RAN' -Path $ExePath
+        Write-Result -Type 'SupportAssist-Uninstaller' -Status 'RAN' -Path $ExePath -Detail $arguments
         $Stats.Value.RanUninstalls++
     }
     catch {

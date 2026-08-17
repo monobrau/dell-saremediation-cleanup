@@ -58,8 +58,13 @@ Command Update SWB blocklists.
   patterns, plus the explicit `SARemediation` data path
 - Each action (uninstaller, service, task, folder) is attempted independently and reported separately, so
   a failure in one step does not stop the rest of the cleanup from being reported
-- Does **not** call `Restart-Computer` or `shutdown` — MSI uninstalls are invoked with `/norestart` to
-  avoid triggering an immediate reboot during bulk runs
+- Does **not** call `Restart-Computer` or `shutdown`
+- Silent uninstalls always get **`/norestart`** and MSI **`REBOOT=ReallySuppress`** (including
+  `SupportAssistUninstaller.exe /arp /S /norestart`). Older builds used `/arp /S` alone, which could
+  still reboot when `-RemoveSupportAssist` ran the Dell uninstaller.
+- Exit **3010** is treated as success with a warning (reboot requested later — not initiated by this script).
+  Nested Dell packages can still reboot on some firmware/OS builds; prefer remediation-only (`-Delete`
+  without `-RemoveSupportAssist`) for lowest reboot risk on live sessions.
 
 ## Requirements
 
@@ -90,7 +95,7 @@ to the full group if you want to confirm matches first.
 #maxlength=100000
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $repo = 'monobrau/dell-saremediation-cleanup'
-$url = "https://raw.githubusercontent.com/$repo/main/Remove-DellSARemediation.ps1?v=1.1.0"
+$url = "https://raw.githubusercontent.com/$repo/main/Remove-DellSARemediation.ps1?v=1.2.0"
 $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
 & ([ScriptBlock]::Create($script)) -Delete
 ```
@@ -103,7 +108,7 @@ $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
 #maxlength=100000
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $repo = 'monobrau/dell-saremediation-cleanup'
-$url = "https://raw.githubusercontent.com/$repo/main/Remove-DellSARemediation.ps1?v=1.1.0"
+$url = "https://raw.githubusercontent.com/$repo/main/Remove-DellSARemediation.ps1?v=1.2.0"
 $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
 & ([ScriptBlock]::Create($script)) -Delete -BlockReinstall
 ```
@@ -116,7 +121,7 @@ $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
 #maxlength=100000
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $repo = 'monobrau/dell-saremediation-cleanup'
-$url = "https://raw.githubusercontent.com/$repo/main/Remove-DellSARemediation.ps1?v=1.1.0"
+$url = "https://raw.githubusercontent.com/$repo/main/Remove-DellSARemediation.ps1?v=1.2.0"
 $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
 & ([ScriptBlock]::Create($script)) -Delete -RemoveSupportAssist
 ```
@@ -127,10 +132,10 @@ $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
 #!cmd
 #timeout=180000
 #maxlength=100000
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "& { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $url = 'https://raw.githubusercontent.com/monobrau/dell-saremediation-cleanup/main/Remove-DellSARemediation.ps1?v=1.1.0'; $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content; & ([ScriptBlock]::Create($script)) -Delete -BlockReinstall }"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "& { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $url = 'https://raw.githubusercontent.com/monobrau/dell-saremediation-cleanup/main/Remove-DellSARemediation.ps1?v=1.2.0'; $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content; & ([ScriptBlock]::Create($script)) -Delete -BlockReinstall }"
 ```
 
-Output should begin with `=== Dell SARemediation Removal v1.1.0 ===` and show `Mode: DELETE` when
+Output should begin with `=== Dell SARemediation Removal v1.2.0 ===` and show `Mode: DELETE` when
 `-Delete` is used.
 
 ### Dry-run (optional — single-machine validation)
@@ -141,7 +146,7 @@ Output should begin with `=== Dell SARemediation Removal v1.1.0 ===` and show `M
 #maxlength=100000
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $repo = 'monobrau/dell-saremediation-cleanup'
-$url = "https://raw.githubusercontent.com/$repo/main/Remove-DellSARemediation.ps1?v=1.1.0"
+$url = "https://raw.githubusercontent.com/$repo/main/Remove-DellSARemediation.ps1?v=1.2.0"
 $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
 & ([ScriptBlock]::Create($script))
 ```
@@ -234,9 +239,11 @@ No changes made. Re-run with -Delete to remove matched items.
 - **SARemediation reappears after reboot or Dell Update:** Re-run bulk deployment with `-Delete
   -BlockReinstall`. Consider blocking Dell SupportAssist deployment via Intune/GPO if it is not
   needed in the environment.
-- **Concerned about reboots during bulk runs:** The script does not reboot endpoints. MSI uninstalls
-  receive `/norestart`; exit code `3010` (reboot eventually required) is accepted as success without
-  scheduling a restart. Use `-SkipUninstaller` only if you need to avoid vendor uninstallers entirely.
+- **Concerned about reboots during bulk runs:** v1.2.0+ always passes `/norestart` and
+  `REBOOT=ReallySuppress` (including SupportAssist’s `/arp /S` path). Exit `3010` is success with a
+  warning — the script does not schedule a restart. Nested Dell packages can still reboot on some
+  builds; for live user sessions prefer `-Delete` without `-RemoveSupportAssist` / `-BlockReinstall`.
+  Use `-SkipUninstaller` only if you need to avoid vendor uninstallers entirely.
 - **SIEM ticket still open after cleanup:** Resolve or allowlist the SentinelOne threat in the console,
   then close the ConnectWise ticket noting authorized Dell software was removed.
 - **`ps: illegal argument`:** The guest is **macOS** (or non-Windows). This script is Windows-only.
@@ -246,3 +253,4 @@ No changes made. Re-run with -Delete to remove matched items.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
