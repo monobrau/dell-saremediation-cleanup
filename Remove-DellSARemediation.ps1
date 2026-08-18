@@ -45,7 +45,7 @@ param(
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.3.0'
+$ScriptVersion = '1.3.1'
 
 if ($env:OS -notlike '*Windows*' -and -not $IsWindows) {
     Write-Output "ERROR: This script supports Windows endpoints only."
@@ -347,6 +347,71 @@ function Stop-RelatedProcesses {
     }
 }
 
+function Stop-RemediationServicesTemporary {
+    # Stop (do not delete) so Backup files unlock; used by -BackupsOnly.
+    $stopped = 0
+    foreach ($svc in @(Get-RemediationServices)) {
+        try {
+            if ($svc.State -eq 'Running') {
+                Stop-Service -Name $svc.Name -Force -ErrorAction Stop
+                Write-Output ("[Service] STOPPED : {0} ({1})" -f $svc.Name, $svc.DisplayName)
+                $stopped++
+            }
+        }
+        catch {
+            Write-Output ("[Service] STOP FAILED : {0} ({1})" -f $svc.Name, $_.Exception.Message)
+        }
+    }
+    return $stopped
+}
+
+function Unlock-PathForDelete {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+
+    # Clear read-only / system / hidden on the tree (best effort).
+    try {
+        Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                try {
+                    $_.Attributes = 'Normal'
+                }
+                catch { }
+            }
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        if ($item) {
+            try { $item.Attributes = 'Normal' } catch { }
+        }
+    }
+    catch { }
+
+    & takeown.exe /f $Path /r /d y 2>&1 | Out-Null
+    & icacls.exe $Path /grant '*S-1-5-32-544:(OI)(CI)F' /t /c /q 2>&1 | Out-Null
+    & icacls.exe $Path /grant 'SYSTEM:(OI)(CI)F' /t /c /q 2>&1 | Out-Null
+}
+
+function Remove-PathForce {
+    param([string]$Path)
+
+    Unlock-PathForDelete -Path $Path
+
+    try {
+        Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+        return $true
+    }
+    catch {
+        # Fallback: cmd rd often succeeds after takeown when .NET still fails on locked handles.
+        $null = & cmd.exe /c "rd /s /q `"$Path`"" 2>&1
+        if (-not (Test-Path -LiteralPath $Path)) {
+            return $true
+        }
+        throw
+    }
+}
+
 function Add-NoRestartFlags {
     param([string]$Arguments)
 
@@ -601,12 +666,16 @@ function Invoke-FolderAction {
 
     try {
         if ($LightProcessStop) {
-            Stop-RelatedProcesses -NamePatterns @('SARemediation')
+            Stop-RelatedProcesses -NamePatterns @('SARemediation', 'SupportAssist')
         }
         else {
             Stop-RelatedProcesses -NamePatterns @('SupportAssist', 'SARemediation', 'DellSupportAssist')
         }
-        Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+        Start-Sleep -Seconds 1
+        Remove-PathForce -Path $Path
+        if (Test-Path -LiteralPath $Path) {
+            throw 'Path still present after remove attempts (likely locked; reboot then re-run -Delete -BackupsOnly).'
+        }
         Write-Result -Type 'Folder' -Status 'REMOVED' -Path $Path
         $Stats.Value.RemovedFolders++
     }
@@ -638,7 +707,7 @@ if (-not $isAdmin) {
 if ($BackupsOnly) {
     $backupFolders = @(Get-SaRemediationBackupFolders)
     Write-Output ("SARemediation snapshot backup folders found: {0}" -f $backupFolders.Count)
-    Write-Output 'Scope: backup folders only (no service/uninstaller/SupportAssist changes).'
+    Write-Output 'Scope: backup folders only (no service delete / SupportAssist uninstall).'
     Write-Output ''
 
     if ($backupFolders.Count -eq 0) {
@@ -652,6 +721,14 @@ if ($BackupsOnly) {
         FailedFolders      = 0
     }
 
+    if ($Delete) {
+        Write-Output 'Preparing: stop SARemediation services (temporary) and unlock ACLs...'
+        [void](Stop-RemediationServicesTemporary)
+        Stop-RelatedProcesses -NamePatterns @('SARemediation', 'SupportAssist', 'DellSupportAssist')
+        Start-Sleep -Seconds 2
+        Write-Output ''
+    }
+
     foreach ($folder in $backupFolders) {
         Invoke-FolderAction -Path $folder -Stats ([ref]$stats) -LightProcessStop
     }
@@ -660,6 +737,9 @@ if ($BackupsOnly) {
     Write-Output '=== Summary ==='
     if ($Delete) {
         Write-Output ("Backup folders removed: {0}; failed: {1}" -f $stats.RemovedFolders, $stats.FailedFolders)
+        if ($stats.FailedFolders -gt 0) {
+            Write-Output 'If Access Denied persists after this unlock attempt: reboot, then re-run -Delete -BackupsOnly before the service recreates files.'
+        }
     }
     else {
         Write-Output ("Backup folders would remove: {0}" -f $stats.WouldRemoveFolders)
