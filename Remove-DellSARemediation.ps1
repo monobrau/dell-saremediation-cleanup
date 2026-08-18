@@ -46,7 +46,7 @@ param(
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.3.2'
+$ScriptVersion = '1.3.3'
 
 if ($env:OS -notlike '*Windows*' -and -not $IsWindows) {
     Write-Output "ERROR: This script supports Windows endpoints only."
@@ -444,23 +444,38 @@ function Clear-BackupFolderContents {
         Start-Sleep -Seconds 1
         Unlock-PathForDelete -Path $Path
 
-        $failed = 0
-        foreach ($child in $children) {
+        # Robocopy /MIR from an empty dir clears stubborn trees better than Remove-Item (folder kept).
+        $empty = Join-Path $env:TEMP ("sa-backup-empty-" + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $empty -Force | Out-Null
+        try {
+            & robocopy.exe $empty $Path /MIR /R:1 /W:1 /NFL /NDL /NJH /NJS /NC /NS /NP 2>&1 | Out-Null
+        }
+        finally {
+            Remove-Item -LiteralPath $empty -Force -ErrorAction SilentlyContinue
+        }
+
+        # File-by-file leftovers
+        $left = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue)
+        foreach ($child in $left) {
             try {
-                Remove-PathForce -Path $child.FullName
-                if (Test-Path -LiteralPath $child.FullName) {
-                    $failed++
+                Unlock-PathForDelete -Path $child.FullName
+                if ($child.PSIsContainer) {
+                    $null = & cmd.exe /c "rd /s /q `"$($child.FullName)`"" 2>&1
                 }
                 else {
+                    $null = & cmd.exe /c "del /f /q `"$($child.FullName)`"" 2>&1
+                }
+                if (-not (Test-Path -LiteralPath $child.FullName)) {
                     $Stats.Value.ClearedItems++
                 }
             }
-            catch {
-                $failed++
-            }
+            catch { }
         }
 
         $remaining = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue).Count
+        $removedApprox = [Math]::Max(0, $childCount - $remaining)
+        $Stats.Value.ClearedItems = [Math]::Max($Stats.Value.ClearedItems, $removedApprox)
+
         if ($remaining -eq 0) {
             Write-Result -Type 'BackupContent' -Status 'CLEARED' -Path $Path -Detail ("removed {0} item(s); folder kept" -f $childCount)
             $Stats.Value.ClearedFolders++
