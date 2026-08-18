@@ -50,7 +50,7 @@ param(
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.4.0'
+$ScriptVersion = '1.4.1'
 
 if ($env:OS -notlike '*Windows*' -and -not $IsWindows) {
     Write-Output "ERROR: This script supports Windows endpoints only."
@@ -432,15 +432,23 @@ public static extern bool MoveFileEx(string lpExistingFileName, string lpNewFile
 }
 
 function Test-IsScreenConnectBackupFile {
-    param([System.IO.FileInfo]$File)
+    param(
+        [System.IO.FileInfo]$File,
+        [switch]$DeepScan
+    )
 
-    $pattern = '(?i)Screen\s*Connect|Connect\s*Wise|ConnectWise|Barely\s*Software|Control Client|ClientSetup\.exe'
+    # Hash-named Dell copies of PE files only — skip junk quickly.
+    if ($File.Extension -notmatch '(?i)^\.(exe|dll|msi|sys|scr)$') {
+        return @{ Match = $false; Reason = '' }
+    }
+
+    $pattern = '(?i)Screen\s*Connect|Connect\s*Wise|ConnectWise|Barely\s*Software|ClientSetup\.exe|ScreenConnect\.'
 
     try {
         $vi = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($File.FullName)
         $meta = @(
             $vi.CompanyName, $vi.ProductName, $vi.FileDescription,
-            $vi.OriginalFilename, $vi.InternalName, $vi.FileName
+            $vi.OriginalFilename, $vi.InternalName
         ) -join '|'
         if ($meta -match $pattern) {
             return @{ Match = $true; Reason = 'VersionInfo' }
@@ -448,27 +456,18 @@ function Test-IsScreenConnectBackupFile {
     }
     catch { }
 
-    try {
-        $sig = Get-AuthenticodeSignature -FilePath $File.FullName -ErrorAction SilentlyContinue
-        if ($sig -and $sig.SignerCertificate) {
-            $subj = $sig.SignerCertificate.Subject
-            $iss = $sig.SignerCertificate.Issuer
-            if (("$subj|$iss") -match $pattern) {
-                return @{ Match = $true; Reason = ("Authenticode:{0}" -f $sig.Status) }
-            }
-        }
-    }
-    catch { }
-
+    # Small ASCII peek (not Authenticode — that is extremely slow on large Backup trees).
     try {
         $fs = [System.IO.File]::Open($File.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
         try {
-            $len = [Math]::Min(2MB, [int64]$fs.Length)
-            $buf = New-Object byte[] $len
-            $read = $fs.Read($buf, 0, $buf.Length)
-            $ascii = [System.Text.Encoding]::ASCII.GetString($buf, 0, $read)
-            if ($ascii -match $pattern) {
-                return @{ Match = $true; Reason = 'EmbeddedString' }
+            $len = [Math]::Min(262144, [int64]$fs.Length) # 256 KB
+            if ($len -gt 0) {
+                $buf = New-Object byte[] $len
+                $read = $fs.Read($buf, 0, $buf.Length)
+                $ascii = [System.Text.Encoding]::ASCII.GetString($buf, 0, $read)
+                if ($ascii -match $pattern) {
+                    return @{ Match = $true; Reason = 'EmbeddedString' }
+                }
             }
         }
         finally {
@@ -476,6 +475,20 @@ function Test-IsScreenConnectBackupFile {
         }
     }
     catch { }
+
+    if ($DeepScan) {
+        try {
+            $sig = Get-AuthenticodeSignature -FilePath $File.FullName -ErrorAction SilentlyContinue
+            if ($sig -and $sig.SignerCertificate) {
+                $subj = $sig.SignerCertificate.Subject
+                $iss = $sig.SignerCertificate.Issuer
+                if (("$subj|$iss") -match $pattern) {
+                    return @{ Match = $true; Reason = ("Authenticode:{0}" -f $sig.Status) }
+                }
+            }
+        }
+        catch { }
+    }
 
     return @{ Match = $false; Reason = '' }
 }
@@ -521,13 +534,21 @@ function Clear-ScreenConnectBackupFiles {
         return
     }
 
+    Write-Output ("Scanning: {0}" -f $FolderPath)
     $files = @(Get-ChildItem -LiteralPath $FolderPath -File -Recurse -Force -ErrorAction SilentlyContinue)
-    $matches = @()
+    Write-Output ("Files enumerated: {0} (PE candidates scanned next; Authenticode skipped for speed)" -f $files.Count)
 
+    $matches = New-Object System.Collections.Generic.List[object]
+    $i = 0
     foreach ($file in $files) {
+        $i++
+        if (($i % 50) -eq 0 -or $i -eq $files.Count) {
+            Write-Output ("  ... scanned {0}/{1}" -f $i, $files.Count)
+        }
         $hit = Test-IsScreenConnectBackupFile -File $file
         if ($hit.Match) {
-            $matches += [pscustomobject]@{ File = $file; Reason = $hit.Reason }
+            [void]$matches.Add([pscustomobject]@{ File = $file; Reason = $hit.Reason })
+            Write-Output ("  HIT: {0} ({1})" -f $file.Name, $hit.Reason)
         }
     }
 
