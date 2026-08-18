@@ -26,19 +26,26 @@
     tasks, disables remediation-related services, and (when combined with -Delete) also enables
     -RemoveSupportAssist. Does not block every factory preload path; pair with Intune/GPO app blocklists
     for fleet-wide enforcement when needed.
+
+.PARAMETER BackupsOnly
+    Only target System Repair snapshot backup folders under ProgramData\Dell\SARemediation
+    (typically ...\SystemRepair\Snapshots\Backup). Does not uninstall SARemediation/SupportAssist,
+    stop services, or remove scheduled tasks. Preferred for SentinelOne FP cleanup of hash-named
+    backup .exe/.dll copies. Ignores -RemoveSupportAssist / -BlockReinstall when set.
 #>
 [CmdletBinding()]
 param(
     [switch]$Delete,
     [switch]$SkipUninstaller,
     [switch]$RemoveSupportAssist,
-    [switch]$BlockReinstall
+    [switch]$BlockReinstall,
+    [switch]$BackupsOnly
 )
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.2.0'
+$ScriptVersion = '1.3.0'
 
 if ($env:OS -notlike '*Windows*' -and -not $IsWindows) {
     Write-Output "ERROR: This script supports Windows endpoints only."
@@ -64,6 +71,12 @@ $RemediationServiceDisableNames = @(
     'Dell SupportAssist Remediation',
     'Alienware SupportAssist Remediation'
 )
+
+if ($BackupsOnly -and ($RemoveSupportAssist -or $BlockReinstall)) {
+    Write-Output 'WARNING: -BackupsOnly is set; ignoring -RemoveSupportAssist / -BlockReinstall.'
+    $RemoveSupportAssist = $false
+    $BlockReinstall = $false
+}
 
 if ($BlockReinstall -and $Delete) {
     $RemoveSupportAssist = $true
@@ -234,6 +247,33 @@ function Get-RemediationInstallFolders {
     $saRoot = Join-Path $env:ProgramData 'Dell\SARemediation'
     if ((Test-Path -LiteralPath $saRoot) -and -not $folders.Contains($saRoot)) {
         [void]$folders.Add($saRoot)
+    }
+
+    return $folders
+}
+
+function Get-SaRemediationBackupFolders {
+    # Only the snapshot Backup folders Dell SARemediation creates (S1 FP path), not the whole product.
+    $folders = New-Object System.Collections.Generic.List[string]
+
+    $primary = Join-Path $env:ProgramData 'Dell\SARemediation\SystemRepair\Snapshots\Backup'
+    if (Test-Path -LiteralPath $primary) {
+        [void]$folders.Add($primary)
+    }
+
+    $dellRoot = Join-Path $env:ProgramData 'Dell'
+    if (Test-Path -LiteralPath $dellRoot) {
+        Get-ChildItem -LiteralPath $dellRoot -Directory -Recurse -Force -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Name -eq 'Backup' -and
+                $_.Parent -and ($_.Parent.Name -eq 'Snapshots') -and
+                ($_.FullName -match '(?i)\\SARemediation\\')
+            } |
+            ForEach-Object {
+                if (-not $folders.Contains($_.FullName)) {
+                    [void]$folders.Add($_.FullName)
+                }
+            }
     }
 
     return $folders
@@ -545,7 +585,8 @@ function Invoke-ScheduledTaskAction {
 function Invoke-FolderAction {
     param(
         [string]$Path,
-        [ref]$Stats
+        [ref]$Stats,
+        [switch]$LightProcessStop
     )
 
     if (-not (Test-Path -LiteralPath $Path)) {
@@ -559,7 +600,12 @@ function Invoke-FolderAction {
     }
 
     try {
-        Stop-RelatedProcesses -NamePatterns @('SupportAssist', 'SARemediation', 'DellSupportAssist')
+        if ($LightProcessStop) {
+            Stop-RelatedProcesses -NamePatterns @('SARemediation')
+        }
+        else {
+            Stop-RelatedProcesses -NamePatterns @('SupportAssist', 'SARemediation', 'DellSupportAssist')
+        }
         Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
         Write-Result -Type 'Folder' -Status 'REMOVED' -Path $Path
         $Stats.Value.RemovedFolders++
@@ -571,7 +617,13 @@ function Invoke-FolderAction {
 }
 
 $isAdmin = Test-IsAdministrator
-$mode = if ($Delete) { 'DELETE' } else { 'DRY-RUN' }
+$mode = if ($BackupsOnly) {
+    if ($Delete) { 'BACKUPS-ONLY DELETE' } else { 'BACKUPS-ONLY DRY-RUN' }
+} elseif ($Delete) {
+    'DELETE'
+} else {
+    'DRY-RUN'
+}
 
 Write-Output "=== Dell SARemediation Removal v$ScriptVersion ==="
 Write-Output "Mode: $mode"
@@ -581,6 +633,39 @@ Write-Output ''
 if (-not $isAdmin) {
     Write-Output 'WARNING: Not running elevated. Service, uninstaller, and folder actions will likely fail. Re-run as Administrator.'
     Write-Output ''
+}
+
+if ($BackupsOnly) {
+    $backupFolders = @(Get-SaRemediationBackupFolders)
+    Write-Output ("SARemediation snapshot backup folders found: {0}" -f $backupFolders.Count)
+    Write-Output 'Scope: backup folders only (no service/uninstaller/SupportAssist changes).'
+    Write-Output ''
+
+    if ($backupFolders.Count -eq 0) {
+        Write-Output 'No SARemediation snapshot Backup folders detected under ProgramData\Dell.'
+        return
+    }
+
+    $stats = @{
+        WouldRemoveFolders = 0
+        RemovedFolders     = 0
+        FailedFolders      = 0
+    }
+
+    foreach ($folder in $backupFolders) {
+        Invoke-FolderAction -Path $folder -Stats ([ref]$stats) -LightProcessStop
+    }
+
+    Write-Output ''
+    Write-Output '=== Summary ==='
+    if ($Delete) {
+        Write-Output ("Backup folders removed: {0}; failed: {1}" -f $stats.RemovedFolders, $stats.FailedFolders)
+    }
+    else {
+        Write-Output ("Backup folders would remove: {0}" -f $stats.WouldRemoveFolders)
+        Write-Output 'No changes made. Re-run with -Delete -BackupsOnly to remove backup folders.'
+    }
+    return
 }
 
 $services = @(Get-RemediationServices)
