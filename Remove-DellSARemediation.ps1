@@ -50,7 +50,7 @@ param(
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.4.1'
+$ScriptVersion = '1.4.2'
 
 if ($env:OS -notlike '*Windows*' -and -not $IsWindows) {
     Write-Output "ERROR: This script supports Windows endpoints only."
@@ -353,21 +353,60 @@ function Stop-RelatedProcesses {
 }
 
 function Stop-RemediationServicesTemporary {
-    # Stop (do not delete) so Backup files unlock; used by -BackupsOnly.
+    # Stop (do not delete) with a hard timeout — Stop-Service can hang for many minutes.
+    param([int]$TimeoutSeconds = 15)
+
     $stopped = 0
     foreach ($svc in @(Get-RemediationServices)) {
+        if ($svc.State -ne 'Running') {
+            Write-Output ("[Service] ALREADY STOPPED : {0}" -f $svc.Name)
+            continue
+        }
+
+        Write-Output ("[Service] STOPPING (max {0}s) : {1}" -f $TimeoutSeconds, $svc.Name)
         try {
-            if ($svc.State -eq 'Running') {
-                Stop-Service -Name $svc.Name -Force -ErrorAction Stop
-                Write-Output ("[Service] STOPPED : {0} ({1})" -f $svc.Name, $svc.DisplayName)
+            $null = & sc.exe stop $svc.Name 2>&1
+        }
+        catch { }
+
+        $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+        while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 1
+            $cur = Get-CimInstance -ClassName Win32_Service -Filter ("Name='{0}'" -f $svc.Name.Replace("'", "''")) -ErrorAction SilentlyContinue
+            if (-not $cur -or $cur.State -eq 'Stopped') {
+                Write-Output ("[Service] STOPPED : {0}" -f $svc.Name)
                 $stopped++
+                break
             }
         }
-        catch {
-            Write-Output ("[Service] STOP FAILED : {0} ({1})" -f $svc.Name, $_.Exception.Message)
+
+        $cur = Get-CimInstance -ClassName Win32_Service -Filter ("Name='{0}'" -f $svc.Name.Replace("'", "''")) -ErrorAction SilentlyContinue
+        if ($cur -and $cur.State -ne 'Stopped') {
+            Write-Output ("[Service] STILL {0} after timeout — continuing anyway : {1}" -f $cur.State, $svc.Name)
         }
     }
     return $stopped
+}
+
+function Unlock-FileQuick {
+    # Single file/dir — no recursive takeown (recursive on Backup trees is extremely slow).
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        if ($item) {
+            try { $item.Attributes = 'Normal' } catch { }
+        }
+    }
+    catch { }
+
+    & takeown.exe /f $Path 2>&1 | Out-Null
+    & icacls.exe $Path /grant '*S-1-5-32-544:F' /c /q 2>&1 | Out-Null
+    & icacls.exe $Path /grant 'SYSTEM:F' /c /q 2>&1 | Out-Null
 }
 
 function Unlock-PathForDelete {
@@ -499,7 +538,7 @@ function Remove-BackupFileTarget {
         [ref]$Stats
     )
 
-    Unlock-PathForDelete -Path $Path
+    Unlock-FileQuick -Path $Path
     try {
         Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
     }
@@ -568,9 +607,9 @@ function Clear-ScreenConnectBackupFiles {
         return
     }
 
-    Stop-RelatedProcesses -NamePatterns @('SARemediation', 'SupportAssist', 'DellSupportAssist', 'ScreenConnect')
+    # Do NOT kill ScreenConnect — that drops Backstage/Commands sessions.
+    Stop-RelatedProcesses -NamePatterns @('SARemediation')
     Start-Sleep -Seconds 1
-    Unlock-PathForDelete -Path $FolderPath
 
     foreach ($m in $matches) {
         $status = Remove-BackupFileTarget -Path $m.File.FullName -Stats $Stats
@@ -981,20 +1020,63 @@ if ($BackupsOnly) {
         PendingReboot     = 0
     }
 
-    if ($Delete) {
-        Write-Output 'Preparing: stop SARemediation services (temporary) and unlock ACLs...'
-        [void](Stop-RemediationServicesTemporary)
-        Stop-RelatedProcesses -NamePatterns @('SARemediation', 'SupportAssist', 'DellSupportAssist', 'ScreenConnect')
-        Start-Sleep -Seconds 2
-        Write-Output ''
-    }
-
+    # Scan first (no service stop) so dry-run/delete both show progress immediately.
+    # Service stop is timed and only runs when we actually delete.
     foreach ($folder in $backupFolders) {
         if ($ClearAllBackupContent) {
+            if ($Delete) {
+                Write-Output 'Preparing: stop SARemediation services (timed; will not hang forever)...'
+                [void](Stop-RemediationServicesTemporary -TimeoutSeconds 15)
+                Stop-RelatedProcesses -NamePatterns @('SARemediation')
+                Write-Output ''
+            }
             Clear-BackupFolderContents -Path $folder -Stats ([ref]$stats)
         }
         else {
-            Clear-ScreenConnectBackupFiles -FolderPath $folder -Stats ([ref]$stats)
+            # Enumerate/match first
+            if (-not $Delete) {
+                Clear-ScreenConnectBackupFiles -FolderPath $folder -Stats ([ref]$stats)
+            }
+            else {
+                # Force a scan-only pass by temporarily clearing Delete? Better: split scan from delete.
+                # Clear-ScreenConnectBackupFiles handles both; stop services only if matches found.
+                # Pre-scan without delete using a nested approach:
+                Write-Output ("Scanning before service stop: {0}" -f $folder)
+                $files = @(Get-ChildItem -LiteralPath $folder -File -Recurse -Force -ErrorAction SilentlyContinue)
+                Write-Output ("Files enumerated: {0}" -f $files.Count)
+                $matchCount = 0
+                $i = 0
+                $matchList = New-Object System.Collections.Generic.List[object]
+                foreach ($file in $files) {
+                    $i++
+                    if (($i % 50) -eq 0 -or $i -eq $files.Count) {
+                        Write-Output ("  ... scanned {0}/{1}" -f $i, $files.Count)
+                    }
+                    $hit = Test-IsScreenConnectBackupFile -File $file
+                    if ($hit.Match) {
+                        $matchCount++
+                        [void]$matchList.Add([pscustomobject]@{ File = $file; Reason = $hit.Reason })
+                        Write-Output ("  HIT: {0} ({1})" -f $file.Name, $hit.Reason)
+                    }
+                }
+                Write-Output ("Matches: {0}" -f $matchCount)
+
+                if ($matchCount -eq 0) {
+                    Write-Result -Type 'ScreenConnectBackup' -Status 'NONE' -Path $folder -Detail 'no CW/SC matches in Backup tree'
+                    continue
+                }
+
+                Write-Output 'Preparing: stop SARemediation services (timed; max ~15s each)...'
+                [void](Stop-RemediationServicesTemporary -TimeoutSeconds 15)
+                Stop-RelatedProcesses -NamePatterns @('SARemediation')
+                Start-Sleep -Seconds 1
+                Write-Output ''
+
+                foreach ($m in $matchList) {
+                    $status = Remove-BackupFileTarget -Path $m.File.FullName -Stats ([ref]$stats)
+                    Write-Result -Type 'ScreenConnectBackup' -Status $status -Path $m.File.FullName -Detail $m.Reason
+                }
+            }
         }
     }
 
