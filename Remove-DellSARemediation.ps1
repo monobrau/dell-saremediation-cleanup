@@ -28,10 +28,11 @@
     for fleet-wide enforcement when needed.
 
 .PARAMETER BackupsOnly
-    Only target System Repair snapshot backup folders under ProgramData\Dell\SARemediation
-    (typically ...\SystemRepair\Snapshots\Backup). Does not uninstall SARemediation/SupportAssist,
-    stop services, or remove scheduled tasks. Preferred for SentinelOne FP cleanup of hash-named
-    backup .exe/.dll copies. Ignores -RemoveSupportAssist / -BlockReinstall when set.
+    Only clear contents of System Repair snapshot Backup folders under ProgramData\Dell\SARemediation
+    (typically ...\SystemRepair\Snapshots\Backup). Leaves the Backup directory itself in place.
+    Does not uninstall SARemediation/SupportAssist, delete services, or remove scheduled tasks.
+    Preferred for SentinelOne FP cleanup of hash-named backup .exe/.dll copies.
+    Ignores -RemoveSupportAssist / -BlockReinstall when set.
 #>
 [CmdletBinding()]
 param(
@@ -45,7 +46,7 @@ param(
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.3.1'
+$ScriptVersion = '1.3.2'
 
 if ($env:OS -notlike '*Windows*' -and -not $IsWindows) {
     Write-Output "ERROR: This script supports Windows endpoints only."
@@ -412,6 +413,70 @@ function Remove-PathForce {
     }
 }
 
+function Clear-BackupFolderContents {
+    param(
+        [string]$Path,
+        [ref]$Stats
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+
+    $children = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue)
+    $childCount = $children.Count
+
+    if (-not $Delete) {
+        Write-Result -Type 'BackupContent' -Status 'WOULD CLEAR' -Path $Path -Detail ("{0} item(s)" -f $childCount)
+        $Stats.Value.WouldClearItems += $childCount
+        $Stats.Value.WouldClearFolders++
+        return
+    }
+
+    if ($childCount -eq 0) {
+        Write-Result -Type 'BackupContent' -Status 'EMPTY' -Path $Path -Detail 'nothing to clear'
+        $Stats.Value.ClearedFolders++
+        return
+    }
+
+    try {
+        Stop-RelatedProcesses -NamePatterns @('SARemediation', 'SupportAssist', 'DellSupportAssist')
+        Start-Sleep -Seconds 1
+        Unlock-PathForDelete -Path $Path
+
+        $failed = 0
+        foreach ($child in $children) {
+            try {
+                Remove-PathForce -Path $child.FullName
+                if (Test-Path -LiteralPath $child.FullName) {
+                    $failed++
+                }
+                else {
+                    $Stats.Value.ClearedItems++
+                }
+            }
+            catch {
+                $failed++
+            }
+        }
+
+        $remaining = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue).Count
+        if ($remaining -eq 0) {
+            Write-Result -Type 'BackupContent' -Status 'CLEARED' -Path $Path -Detail ("removed {0} item(s); folder kept" -f $childCount)
+            $Stats.Value.ClearedFolders++
+        }
+        else {
+            Write-Result -Type 'BackupContent' -Status 'PARTIAL' -Path $Path -Detail ("{0} of {1} item(s) remain" -f $remaining, $childCount)
+            $Stats.Value.FailedFolders++
+            $Stats.Value.FailedItems += $remaining
+        }
+    }
+    catch {
+        Write-Result -Type 'BackupContent' -Status 'FAILED' -Path $Path -Detail $_.Exception.Message
+        $Stats.Value.FailedFolders++
+    }
+}
+
 function Add-NoRestartFlags {
     param([string]$Arguments)
 
@@ -707,7 +772,7 @@ if (-not $isAdmin) {
 if ($BackupsOnly) {
     $backupFolders = @(Get-SaRemediationBackupFolders)
     Write-Output ("SARemediation snapshot backup folders found: {0}" -f $backupFolders.Count)
-    Write-Output 'Scope: backup folders only (no service delete / SupportAssist uninstall).'
+    Write-Output 'Scope: clear Backup folder contents only (folder kept; no service delete / SupportAssist uninstall).'
     Write-Output ''
 
     if ($backupFolders.Count -eq 0) {
@@ -716,9 +781,12 @@ if ($BackupsOnly) {
     }
 
     $stats = @{
-        WouldRemoveFolders = 0
-        RemovedFolders     = 0
-        FailedFolders      = 0
+        WouldClearFolders = 0
+        WouldClearItems   = 0
+        ClearedFolders    = 0
+        ClearedItems      = 0
+        FailedFolders     = 0
+        FailedItems       = 0
     }
 
     if ($Delete) {
@@ -730,20 +798,21 @@ if ($BackupsOnly) {
     }
 
     foreach ($folder in $backupFolders) {
-        Invoke-FolderAction -Path $folder -Stats ([ref]$stats) -LightProcessStop
+        Clear-BackupFolderContents -Path $folder -Stats ([ref]$stats)
     }
 
     Write-Output ''
     Write-Output '=== Summary ==='
     if ($Delete) {
-        Write-Output ("Backup folders removed: {0}; failed: {1}" -f $stats.RemovedFolders, $stats.FailedFolders)
-        if ($stats.FailedFolders -gt 0) {
-            Write-Output 'If Access Denied persists after this unlock attempt: reboot, then re-run -Delete -BackupsOnly before the service recreates files.'
+        Write-Output ("Backup folders cleared: {0}; failed/partial: {1}" -f $stats.ClearedFolders, $stats.FailedFolders)
+        Write-Output ("Backup items removed: {0}" -f $stats.ClearedItems)
+        if ($stats.FailedFolders -gt 0 -or $stats.FailedItems -gt 0) {
+            Write-Output 'If items remain locked: reboot, then re-run -Delete -BackupsOnly before the service recreates files.'
         }
     }
     else {
-        Write-Output ("Backup folders would remove: {0}" -f $stats.WouldRemoveFolders)
-        Write-Output 'No changes made. Re-run with -Delete -BackupsOnly to remove backup folders.'
+        Write-Output ("Backup folders would clear: {0} ({1} item(s))" -f $stats.WouldClearFolders, $stats.WouldClearItems)
+        Write-Output 'No changes made. Re-run with -Delete -BackupsOnly to clear backup contents (folder kept).'
     }
     return
 }
