@@ -28,11 +28,14 @@
     for fleet-wide enforcement when needed.
 
 .PARAMETER BackupsOnly
-    Only clear contents of System Repair snapshot Backup folders under ProgramData\Dell\SARemediation
-    (typically ...\SystemRepair\Snapshots\Backup). Leaves the Backup directory itself in place.
-    Does not uninstall SARemediation/SupportAssist, delete services, or remove scheduled tasks.
-    Preferred for SentinelOne FP cleanup of hash-named backup .exe/.dll copies.
-    Ignores -RemoveSupportAssist / -BlockReinstall when set.
+    Target System Repair snapshot Backup folders under ProgramData\Dell\SARemediation
+    (typically ...\SystemRepair\Snapshots\Backup). By default only removes files that look like
+    ConnectWise ScreenConnect / Control remote-access backups (version info, Authenticode, or
+    embedded strings) — the usual SentinelOne revoked-cert hits. Leaves the Backup directory.
+    Does not uninstall SARemediation/SupportAssist. Ignores -RemoveSupportAssist / -BlockReinstall.
+
+.PARAMETER ClearAllBackupContent
+    With -BackupsOnly: clear ALL files under Backup folders (not just ScreenConnect/ConnectWise matches).
 #>
 [CmdletBinding()]
 param(
@@ -40,13 +43,14 @@ param(
     [switch]$SkipUninstaller,
     [switch]$RemoveSupportAssist,
     [switch]$BlockReinstall,
-    [switch]$BackupsOnly
+    [switch]$BackupsOnly,
+    [switch]$ClearAllBackupContent
 )
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.3.3'
+$ScriptVersion = '1.4.0'
 
 if ($env:OS -notlike '*Windows*' -and -not $IsWindows) {
     Write-Output "ERROR: This script supports Windows endpoints only."
@@ -413,6 +417,146 @@ function Remove-PathForce {
     }
 }
 
+function Register-DeleteOnReboot {
+    param([string]$Path)
+
+    if (-not ('DellSa.NativeMethods' -as [type])) {
+        Add-Type -Namespace DellSa -Name NativeMethods -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+public static extern bool MoveFileEx(string lpExistingFileName, string lpNewFileName, int dwFlags);
+'@ -ErrorAction Stop
+    }
+
+    # MOVEFILE_DELAY_UNTIL_REBOOT = 4
+    return [DellSa.NativeMethods]::MoveFileEx($Path, $null, 4)
+}
+
+function Test-IsScreenConnectBackupFile {
+    param([System.IO.FileInfo]$File)
+
+    $pattern = '(?i)Screen\s*Connect|Connect\s*Wise|ConnectWise|Barely\s*Software|Control Client|ClientSetup\.exe'
+
+    try {
+        $vi = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($File.FullName)
+        $meta = @(
+            $vi.CompanyName, $vi.ProductName, $vi.FileDescription,
+            $vi.OriginalFilename, $vi.InternalName, $vi.FileName
+        ) -join '|'
+        if ($meta -match $pattern) {
+            return @{ Match = $true; Reason = 'VersionInfo' }
+        }
+    }
+    catch { }
+
+    try {
+        $sig = Get-AuthenticodeSignature -FilePath $File.FullName -ErrorAction SilentlyContinue
+        if ($sig -and $sig.SignerCertificate) {
+            $subj = $sig.SignerCertificate.Subject
+            $iss = $sig.SignerCertificate.Issuer
+            if (("$subj|$iss") -match $pattern) {
+                return @{ Match = $true; Reason = ("Authenticode:{0}" -f $sig.Status) }
+            }
+        }
+    }
+    catch { }
+
+    try {
+        $fs = [System.IO.File]::Open($File.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try {
+            $len = [Math]::Min(2MB, [int64]$fs.Length)
+            $buf = New-Object byte[] $len
+            $read = $fs.Read($buf, 0, $buf.Length)
+            $ascii = [System.Text.Encoding]::ASCII.GetString($buf, 0, $read)
+            if ($ascii -match $pattern) {
+                return @{ Match = $true; Reason = 'EmbeddedString' }
+            }
+        }
+        finally {
+            $fs.Dispose()
+        }
+    }
+    catch { }
+
+    return @{ Match = $false; Reason = '' }
+}
+
+function Remove-BackupFileTarget {
+    param(
+        [string]$Path,
+        [ref]$Stats
+    )
+
+    Unlock-PathForDelete -Path $Path
+    try {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+    }
+    catch {
+        $null = & cmd.exe /c "del /f /q `"$Path`"" 2>&1
+    }
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        $Stats.Value.ClearedItems++
+        return 'REMOVED'
+    }
+
+    try {
+        if (Register-DeleteOnReboot -Path $Path) {
+            $Stats.Value.PendingReboot++
+            return 'PENDING_REBOOT'
+        }
+    }
+    catch { }
+
+    $Stats.Value.FailedItems++
+    return 'FAILED'
+}
+
+function Clear-ScreenConnectBackupFiles {
+    param(
+        [string]$FolderPath,
+        [ref]$Stats
+    )
+
+    if (-not (Test-Path -LiteralPath $FolderPath)) {
+        return
+    }
+
+    $files = @(Get-ChildItem -LiteralPath $FolderPath -File -Recurse -Force -ErrorAction SilentlyContinue)
+    $matches = @()
+
+    foreach ($file in $files) {
+        $hit = Test-IsScreenConnectBackupFile -File $file
+        if ($hit.Match) {
+            $matches += [pscustomobject]@{ File = $file; Reason = $hit.Reason }
+        }
+    }
+
+    Write-Output ("[{0}] ScreenConnect/ConnectWise-like files: {1} of {2}" -f $FolderPath, $matches.Count, $files.Count)
+
+    if ($matches.Count -eq 0) {
+        Write-Result -Type 'ScreenConnectBackup' -Status 'NONE' -Path $FolderPath -Detail 'no CW/SC matches in Backup tree'
+        return
+    }
+
+    if (-not $Delete) {
+        foreach ($m in $matches) {
+            Write-Result -Type 'ScreenConnectBackup' -Status 'WOULD REMOVE' -Path $m.File.FullName -Detail $m.Reason
+            $Stats.Value.WouldClearItems++
+        }
+        $Stats.Value.WouldClearFolders++
+        return
+    }
+
+    Stop-RelatedProcesses -NamePatterns @('SARemediation', 'SupportAssist', 'DellSupportAssist', 'ScreenConnect')
+    Start-Sleep -Seconds 1
+    Unlock-PathForDelete -Path $FolderPath
+
+    foreach ($m in $matches) {
+        $status = Remove-BackupFileTarget -Path $m.File.FullName -Stats $Stats
+        Write-Result -Type 'ScreenConnectBackup' -Status $status -Path $m.File.FullName -Detail $m.Reason
+    }
+}
+
 function Clear-BackupFolderContents {
     param(
         [string]$Path,
@@ -767,7 +911,12 @@ function Invoke-FolderAction {
 
 $isAdmin = Test-IsAdministrator
 $mode = if ($BackupsOnly) {
-    if ($Delete) { 'BACKUPS-ONLY DELETE' } else { 'BACKUPS-ONLY DRY-RUN' }
+    if ($ClearAllBackupContent) {
+        if ($Delete) { 'BACKUPS-ALL-CONTENT DELETE' } else { 'BACKUPS-ALL-CONTENT DRY-RUN' }
+    }
+    else {
+        if ($Delete) { 'SCREENCONNECT-BACKUPS DELETE' } else { 'SCREENCONNECT-BACKUPS DRY-RUN' }
+    }
 } elseif ($Delete) {
     'DELETE'
 } else {
@@ -787,7 +936,13 @@ if (-not $isAdmin) {
 if ($BackupsOnly) {
     $backupFolders = @(Get-SaRemediationBackupFolders)
     Write-Output ("SARemediation snapshot backup folders found: {0}" -f $backupFolders.Count)
-    Write-Output 'Scope: clear Backup folder contents only (folder kept; no service delete / SupportAssist uninstall).'
+    if ($ClearAllBackupContent) {
+        Write-Output 'Scope: clear ALL Backup folder contents (folder kept).'
+    }
+    else {
+        Write-Output 'Scope: remove ScreenConnect/ConnectWise-like files inside Backup only (folder kept).'
+        Write-Output 'Tip: use -ClearAllBackupContent to wipe every file under Backup instead.'
+    }
     Write-Output ''
 
     if ($backupFolders.Count -eq 0) {
@@ -802,32 +957,45 @@ if ($BackupsOnly) {
         ClearedItems      = 0
         FailedFolders     = 0
         FailedItems       = 0
+        PendingReboot     = 0
     }
 
     if ($Delete) {
         Write-Output 'Preparing: stop SARemediation services (temporary) and unlock ACLs...'
         [void](Stop-RemediationServicesTemporary)
-        Stop-RelatedProcesses -NamePatterns @('SARemediation', 'SupportAssist', 'DellSupportAssist')
+        Stop-RelatedProcesses -NamePatterns @('SARemediation', 'SupportAssist', 'DellSupportAssist', 'ScreenConnect')
         Start-Sleep -Seconds 2
         Write-Output ''
     }
 
     foreach ($folder in $backupFolders) {
-        Clear-BackupFolderContents -Path $folder -Stats ([ref]$stats)
+        if ($ClearAllBackupContent) {
+            Clear-BackupFolderContents -Path $folder -Stats ([ref]$stats)
+        }
+        else {
+            Clear-ScreenConnectBackupFiles -FolderPath $folder -Stats ([ref]$stats)
+        }
     }
 
     Write-Output ''
     Write-Output '=== Summary ==='
     if ($Delete) {
-        Write-Output ("Backup folders cleared: {0}; failed/partial: {1}" -f $stats.ClearedFolders, $stats.FailedFolders)
-        Write-Output ("Backup items removed: {0}" -f $stats.ClearedItems)
-        if ($stats.FailedFolders -gt 0 -or $stats.FailedItems -gt 0) {
-            Write-Output 'If items remain locked: reboot, then re-run -Delete -BackupsOnly before the service recreates files.'
+        if ($ClearAllBackupContent) {
+            Write-Output ("Backup folders cleared: {0}; failed/partial: {1}" -f $stats.ClearedFolders, $stats.FailedFolders)
+        }
+        Write-Output ("Target files removed: {0}" -f $stats.ClearedItems)
+        Write-Output ("Queued for delete on reboot: {0}" -f $stats.PendingReboot)
+        Write-Output ("Failed: {0}" -f $stats.FailedItems)
+        if ($stats.PendingReboot -gt 0) {
+            Write-Output 'Reboot when convenient so pending deletes finish, then re-scan Backup and S1.'
+        }
+        if ($stats.FailedItems -gt 0 -or $stats.FailedFolders -gt 0) {
+            Write-Output 'If files remain: disable SupportAssist System Repair, reboot, re-run, or use -ClearAllBackupContent.'
         }
     }
     else {
-        Write-Output ("Backup folders would clear: {0} ({1} item(s))" -f $stats.WouldClearFolders, $stats.WouldClearItems)
-        Write-Output 'No changes made. Re-run with -Delete -BackupsOnly to clear backup contents (folder kept).'
+        Write-Output ("Would remove: {0} file(s)" -f $stats.WouldClearItems)
+        Write-Output 'No changes made. Re-run with -Delete -BackupsOnly (add -ClearAllBackupContent to wipe all Backup files).'
     }
     return
 }

@@ -87,10 +87,10 @@ For **bulk deployment**, select the target machine group in ScreenConnect, paste
 commands below, and run. Dry-run is optional — use it on one representative endpoint before rolling out
 to the full group if you want to confirm matches first.
 
-### Bulk deployment — snapshot backups only (preferred / safest)
+### Bulk deployment — ScreenConnect backups in SARemediation (preferred / safest)
 
-Removes only `ProgramData\Dell\SARemediation\...\Snapshots\Backup` (the hash-named recovery copies that
-EDR often flags). Does **not** uninstall SARemediation or SupportAssist.
+Removes ConnectWise ScreenConnect/Control-like files inside `ProgramData\Dell\SARemediation\...\Snapshots\Backup`
+(the revoked-cert copies SentinelOne flags). Keeps the Backup folder. Does **not** uninstall SARemediation or SupportAssist.
 
 ```powershell
 #!ps
@@ -98,7 +98,7 @@ EDR often flags). Does **not** uninstall SARemediation or SupportAssist.
 #maxlength=100000
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $repo = 'monobrau/dell-saremediation-cleanup'
-$url = "https://raw.githubusercontent.com/$repo/main/Remove-DellSARemediation.ps1?v=1.3.3"
+$url = "https://raw.githubusercontent.com/$repo/main/Remove-DellSARemediation.ps1?v=1.4.0"
 $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
 & ([ScriptBlock]::Create($script)) -Delete -BackupsOnly
 ```
@@ -111,7 +111,7 @@ $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
 #maxlength=100000
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $repo = 'monobrau/dell-saremediation-cleanup'
-$url = "https://raw.githubusercontent.com/$repo/main/Remove-DellSARemediation.ps1?v=1.3.3"
+$url = "https://raw.githubusercontent.com/$repo/main/Remove-DellSARemediation.ps1?v=1.4.0"
 $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
 & ([ScriptBlock]::Create($script)) -Delete
 ```
@@ -124,7 +124,7 @@ $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
 #maxlength=100000
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $repo = 'monobrau/dell-saremediation-cleanup'
-$url = "https://raw.githubusercontent.com/$repo/main/Remove-DellSARemediation.ps1?v=1.3.3"
+$url = "https://raw.githubusercontent.com/$repo/main/Remove-DellSARemediation.ps1?v=1.4.0"
 $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
 & ([ScriptBlock]::Create($script)) -Delete -BlockReinstall
 ```
@@ -137,7 +137,7 @@ $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
 #maxlength=100000
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $repo = 'monobrau/dell-saremediation-cleanup'
-$url = "https://raw.githubusercontent.com/$repo/main/Remove-DellSARemediation.ps1?v=1.3.3"
+$url = "https://raw.githubusercontent.com/$repo/main/Remove-DellSARemediation.ps1?v=1.4.0"
 $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
 & ([ScriptBlock]::Create($script)) -Delete -RemoveSupportAssist
 ```
@@ -148,10 +148,10 @@ $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
 #!cmd
 #timeout=180000
 #maxlength=100000
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "& { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $url = 'https://raw.githubusercontent.com/monobrau/dell-saremediation-cleanup/main/Remove-DellSARemediation.ps1?v=1.3.3'; $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content; & ([ScriptBlock]::Create($script)) -Delete -BackupsOnly }"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "& { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $url = 'https://raw.githubusercontent.com/monobrau/dell-saremediation-cleanup/main/Remove-DellSARemediation.ps1?v=1.4.0'; $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content; & ([ScriptBlock]::Create($script)) -Delete -BackupsOnly }"
 ```
 
-Output should begin with `=== Dell SARemediation Removal v1.3.3 ===`. Backups-only delete shows
+Output should begin with `=== Dell SARemediation Removal v1.4.0 ===`. Backups-only delete shows
 `Mode: BACKUPS-ONLY DELETE`.
 
 ### Dry-run (optional — single-machine validation)
@@ -162,7 +162,7 @@ Output should begin with `=== Dell SARemediation Removal v1.3.3 ===`. Backups-on
 #maxlength=100000
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $repo = 'monobrau/dell-saremediation-cleanup'
-$url = "https://raw.githubusercontent.com/$repo/main/Remove-DellSARemediation.ps1?v=1.3.3"
+$url = "https://raw.githubusercontent.com/$repo/main/Remove-DellSARemediation.ps1?v=1.4.0"
 $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
 & ([ScriptBlock]::Create($script)) -BackupsOnly
 ```
@@ -173,8 +173,11 @@ $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
 # Dry-run backup folders only
 .\Remove-DellSARemediation.ps1 -BackupsOnly
 
-# Clear snapshot Backup folder contents only — preferred for EDR FP cleanup (run elevated)
+# Remove ScreenConnect/ConnectWise-like files from Backup (S1 revoked-cert hygiene)
 .\Remove-DellSARemediation.ps1 -Delete -BackupsOnly
+
+# Clear ALL Backup folder contents
+.\Remove-DellSARemediation.ps1 -Delete -BackupsOnly -ClearAllBackupContent
 
 # Full remediation remove (service/tasks/install + data)
 .\Remove-DellSARemediation.ps1 -Delete
@@ -195,6 +198,7 @@ $script = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
 |-----------|---------|-------------|
 | `-Delete` | off | Remove matched items (or backup folders when combined with `-BackupsOnly`) |
 | `-BackupsOnly` | off | Only target `...\SARemediation\...\Snapshots\Backup` folders; no uninstall/service changes |
+| `-ClearAllBackupContent` | off | With `-BackupsOnly`: clear every file under Backup, not only CW/SC matches |
 | `-SkipUninstaller` | off | Do not run registry uninstall strings or known vendor uninstaller executables |
 | `-RemoveSupportAssist` | off | Also uninstall Dell SupportAssist, its services/tasks/folders, and leftover registry keys |
 | `-BlockReinstall` | off | Disable Dell update delivery tasks/services; with `-Delete`, also enables `-RemoveSupportAssist` |
@@ -259,7 +263,7 @@ No changes made. Re-run with -Delete to remove matched items.
 - **SARemediation reappears after reboot or Dell Update:** Re-run bulk deployment with `-Delete
   -BlockReinstall`. Consider blocking Dell SupportAssist deployment via Intune/GPO if it is not
   needed in the environment.
-- **Access denied on Backup folder:** v1.3.3+ stops SARemediation services temporarily, runs takeown/icacls, then deletes. If it still fails, reboot and immediately re-run `-Delete -BackupsOnly` before the service recreates files.
+- **Access denied on Backup folder:** v1.4.0+ stops SARemediation services temporarily, runs takeown/icacls, then deletes. If it still fails, reboot and immediately re-run `-Delete -BackupsOnly` before the service recreates files.
 - **Concerned about reboots during bulk runs:** Prefer `-Delete -BackupsOnly` (no uninstallers).
   v1.2.0+ full uninstalls always pass `/norestart` and `REBOOT=ReallySuppress`. Nested Dell packages can
   still reboot on some builds; avoid `-RemoveSupportAssist` / `-BlockReinstall` on live sessions.
@@ -272,6 +276,8 @@ No changes made. Re-run with -Delete to remove matched items.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+
 
 
 
